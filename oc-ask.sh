@@ -29,6 +29,10 @@ JQ="${JQ:-jq}"
 KUBECONFIG="${KUBECONFIG:-}"
 OC_CONTEXT="${OC_CONTEXT:-}"
 
+# Debug log in the present working directory (overwritten each run).
+# Set OC_ASK_LOG to an absolute path, or empty to disable.
+OC_ASK_LOG="${OC_ASK_LOG:-oc_ask_log.txt}"
+
 # Caps for --check so a fully broken cluster does not dump megabytes of logs.
 CHECK_MAX_OPS="${CHECK_MAX_OPS:-5}"
 CHECK_MAX_NS="${CHECK_MAX_NS:-4}"
@@ -76,6 +80,87 @@ LAST_RC=0
 _OUTFILE=""
 _ERRFILE=""
 
+# Absolute path of the debug log once log_init succeeds; empty if disabled.
+LOG_FILE=""
+OC_ASK_ORIG_ARGS=()
+
+###############################################################################
+# debug log — oc_ask_log.txt in the current working directory
+###############################################################################
+
+log_note() {
+	[[ -n "${LOG_FILE:-}" ]] || return 0
+	local restore_x=0
+	case "$-" in *x*) restore_x=1; set +x ;; esac
+	printf '%s\n' "$*" >>"$LOG_FILE" 2>/dev/null || true
+	[[ "$restore_x" -eq 1 ]] && set -x
+	return 0
+}
+
+log_block() {
+	local title="$1"
+	local body="${2-}"
+	[[ -n "${LOG_FILE:-}" ]] || return 0
+	local restore_x=0
+	case "$-" in *x*) restore_x=1; set +x ;; esac
+	{
+		echo
+		echo "----- $title -----"
+		printf '%s\n' "$body"
+		echo "----- end -----"
+	} >>"$LOG_FILE" 2>/dev/null || true
+	[[ "$restore_x" -eq 1 ]] && set -x
+	return 0
+}
+
+oc_ask_cleanup() {
+	local rc=$?
+	set +x 2>/dev/null || true
+	if [[ -n "${LOG_FILE:-}" ]]; then
+		unset BASH_XTRACEFD
+		exec 4>&- 2>/dev/null || true
+		{
+			echo
+			echo "===== oc-ask exit rc=$rc $(date -u +%Y-%m-%dT%H:%M:%SZ) ====="
+		} >>"$LOG_FILE" 2>/dev/null || true
+	fi
+	rm -f "${_OUTFILE:-}" "${_ERRFILE:-}"
+}
+
+# Overwrite the cwd log (or OC_ASK_LOG). Trace bash to the log only, not the terminal.
+log_init() {
+	trap oc_ask_cleanup EXIT
+	local dest="${OC_ASK_LOG-oc_ask_log.txt}"
+	if [[ -z "$dest" ]]; then
+		return 0
+	fi
+	if [[ "$dest" != /* ]]; then
+		dest="$(pwd)/$dest"
+	fi
+	if ! {
+		echo "===== oc-ask session $(date -u +%Y-%m-%dT%H:%M:%SZ) ====="
+		echo "cwd: $(pwd)"
+		echo "argv: ${OC_ASK_ORIG_ARGS[*]-}"
+		echo "bash: $BASH_VERSION pid=$$"
+		echo "OC=${OC:-} HAS_JQ=${HAS_JQ:-0} DRY_RUN=${DRY_RUN:-0}"
+		echo "KUBECONFIG=${KUBECONFIG:-} OC_CONTEXT=${OC_CONTEXT:-}"
+		echo "FORCE_INTENT=${FORCE_INTENT:-}"
+		echo "log: $dest"
+		echo
+	} >"$dest" 2>/dev/null; then
+		echo "oc-ask: could not write debug log $dest (continuing without it)" >&2
+		return 0
+	fi
+	LOG_FILE="$dest"
+	echo "oc-ask: debug log $LOG_FILE" >&2
+	if exec 4>>"$LOG_FILE"; then
+		BASH_XTRACEFD=4
+		export BASH_XTRACEFD
+		PS4='+ ${BASH_SOURCE##*/}:${LINENO}:${FUNCNAME[0]:-main}: '
+		set -x
+	fi
+}
+
 INTENT_IDS=()
 declare -A INTENT_TITLE=()
 declare -A INTENT_EXAMPLES=()
@@ -122,6 +207,8 @@ Flags:
   --list, -l        print playbooks and example questions
   --dry-run, -n     print allowlisted oc commands; do not call the cluster
   --self-test       matcher + allowlist tests (no cluster required)
+  --log FILE        debug log path (default: ./oc_ask_log.txt in cwd)
+  --no-log          do not write a debug log
   --help, -h
 
 Examples:
@@ -145,6 +232,10 @@ Customer workloads scheduled on masters are ignored.
 This script never creates, patches, or deletes cluster objects. When a
 write is required it prints the command for you to run yourself.
 JSON is parsed with jq when it is on PATH.
+
+Each run overwrites oc_ask_log.txt in the current working directory (commands,
+oc stdout/stderr, jq results, and a bash trace). Send that file if the script
+fails. It may contain cluster details from oc output.
 EOF
 }
 
@@ -165,10 +256,12 @@ reset_report() {
 
 finding() {
 	FINDINGS+=("$1")
+	log_note "FINDING $1"
 }
 
 suggest() {
 	SUGGESTIONS+=("$1")
+	log_note "SUGGEST $1"
 }
 
 suggest_blank() {
@@ -245,7 +338,6 @@ init_tempfiles() {
 	fi
 	_OUTFILE="$(mktemp "${TMPDIR:-/tmp}/oc-ask.out.XXXXXX")"
 	_ERRFILE="$(mktemp "${TMPDIR:-/tmp}/oc-ask.err.XXXXXX")"
-	trap 'rm -f "$_OUTFILE" "$_ERRFILE"' EXIT
 }
 
 format_cmd() {
@@ -345,6 +437,7 @@ oc_ro() {
 	if ! oc_ro_validate "$@"; then
 		LAST_RC=2
 		finding "internal: refused non-read-only oc invocation: $*"
+		log_note "oc_ro refused: $*"
 		return 2
 	fi
 
@@ -352,6 +445,7 @@ oc_ro() {
 
 	if [[ "$DRY_RUN" -eq 1 ]]; then
 		LAST_RC=0
+		log_note "oc_ro dry-run: $(format_cmd "$@")"
 		return 0
 	fi
 
@@ -367,6 +461,7 @@ oc_ro() {
 	fi
 	LAST_OUT="$(cat "$_OUTFILE")"
 	LAST_ERR="$(cat "$_ERRFILE")"
+	log_block "oc rc=$LAST_RC $(format_cmd "$@")" $'stdout:\n'"${LAST_OUT}"$'\n\nstderr:\n'"${LAST_ERR}"
 	return "$LAST_RC"
 }
 
@@ -395,11 +490,13 @@ jq_eval() {
 	JQ_OUT="$(printf '%s' "$json" | "$JQ" -r "$query" 2>/dev/null)" || rc=$?
 	if [[ "$rc" -ne 0 ]]; then
 		JQ_OUT=""
+		log_block "jq FAIL query" "$query"
 		return 1
 	fi
 	if [[ "$JQ_OUT" == "null" ]]; then
 		JQ_OUT=""
 	fi
+	log_block "jq ok" $'query:\n'"$query"$'\n\nJQ_OUT:\n'"$JQ_OUT"
 	return 0
 }
 
@@ -614,6 +711,289 @@ drill_namespace_pods() {
 	done <<<"$JQ_OUT"
 }
 
+# Operator-specific path (native CRs) then relatedObjects + pods.
+# Missing CRDs (wrong platform / older OCP) become findings, not aborts.
+
+co_note_get() {
+	local label="$1"
+	shift
+	finding "    $label — generated: oc $*"
+	oc_ro "$@" || true
+	if [[ "$LAST_RC" -ne 0 ]]; then
+		finding "    $label: GET failed ($(trim "$LAST_ERR"))"
+		return 1
+	fi
+	if [[ "$DRY_RUN" -eq 1 ]]; then
+		return 0
+	fi
+	if lines_nonempty "$LAST_OUT"; then
+		append_log_excerpt "    $label" "$LAST_OUT" 50
+	else
+		finding "    $label: (empty)"
+	fi
+	return 0
+}
+
+# Shared InstallerController pattern: etcd, kube-apiserver, kcm, kube-scheduler.
+co_path_staticpod() {
+	local resource="$1"
+	local operand_ns="$2"
+	finding "    static-pod operator CR $resource/cluster (currentRevision vs targetRevision per node)"
+	co_note_get "$resource conditions" get "$resource" cluster -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}) {.message}{"\n"}{end}'
+	co_note_get "$resource nodeStatuses" get "$resource" cluster -o jsonpath='{range .status.nodeStatuses[*]}{.nodeName}{" current="}{.currentRevision}{" target="}{.targetRevision}{"\n"}{end}'
+	co_note_get "$operand_ns pods" get pods -n "$operand_ns" --no-headers
+}
+
+co_path_etcd() {
+	co_path_staticpod etcd openshift-etcd
+}
+
+co_path_kube_apiserver() {
+	co_path_staticpod kubeapiserver openshift-kube-apiserver
+	co_note_get "API ready" get --raw /readyz
+	co_note_get "aggregated APIServices" get apiservice --no-headers
+}
+
+co_path_kube_controller_manager() {
+	co_path_staticpod kubecontrollermanager openshift-kube-controller-manager
+}
+
+co_path_kube_scheduler() {
+	co_path_staticpod kubescheduler openshift-kube-scheduler
+}
+
+co_path_openshift_apiserver() {
+	co_note_get "OpenShiftAPIServer CR" get openshiftapiserver cluster -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}) {.message}{"\n"}{end}'
+	co_note_get "openshift-apiserver pods" get pods -n openshift-apiserver --no-headers
+	co_note_get "APIServices" get apiservice
+}
+
+co_path_openshift_controller_manager() {
+	co_note_get "OpenShiftControllerManager CR" get openshiftcontrollermanager cluster -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}) {.message}{"\n"}{end}'
+	co_note_get "openshift-controller-manager pods" get pods -n openshift-controller-manager --no-headers
+	co_note_get "route-controller-manager pods" get pods -n openshift-route-controller-manager --no-headers
+}
+
+co_path_authentication() {
+	co_note_get "Authentication config" get authentication cluster -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}) {.message}{"\n"}{end}'
+	co_note_get "OAuth config identity providers" get oauth cluster -o jsonpath='{range .spec.identityProviders[*]}{.name}{" type="}{.type}{"\n"}{end}'
+	co_note_get "oauth-apiserver pods" get pods -n openshift-oauth-apiserver --no-headers
+	co_note_get "oauth-server pods" get pods -n openshift-authentication --no-headers
+	co_note_get "authentication-operator pods" get pods -n openshift-authentication-operator --no-headers
+}
+
+co_path_network() {
+	co_note_get "Network.operator" get network.operator cluster -o jsonpath='{.spec.defaultNetwork.type}{"\n"}{range .status.conditions[*]}{.type}={.status} ({.reason}) {.message}{"\n"}{end}'
+	co_note_get "Network.config" get network.config cluster -o jsonpath='{.spec.networkType} clusterNetwork={.spec.clusterNetwork}{"\n"}'
+	co_note_get "ovn control-plane + node pods" get pods -n openshift-ovn-kubernetes --no-headers
+	co_note_get "network-operator pods" get pods -n openshift-network-operator --no-headers
+}
+
+co_path_dns() {
+	co_note_get "DNS.operator" get dns.operator cluster -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}) {.message}{"\n"}{end}'
+	co_note_get "DNS.config" get dns.config cluster -o jsonpath='baseDomain={.spec.baseDomain}{"\n"}'
+	co_note_get "openshift-dns pods" get pods -n openshift-dns --no-headers
+	co_note_get "dns-operator pods" get pods -n openshift-dns-operator --no-headers
+}
+
+co_path_machine_config() {
+	co_note_get "MachineConfigPools" get mcp
+	co_note_get "MCP conditions" get mcp -o jsonpath='{range .items[*]}{.metadata.name}{" paused="}{.spec.paused}{" ready="}{.status.readyMachineCount}{"/"}{.status.machineCount}{" degraded="}{.status.degradedMachineCount}{"\n"}{end}'
+	co_note_get "MCO pods" get pods -n openshift-machine-config-operator --no-headers
+}
+
+co_path_machine_api() {
+	co_note_get "Machines" get machines -n openshift-machine-api
+	co_note_get "MachineSets" get machinesets -n openshift-machine-api
+	co_note_get "machine-api pods" get pods -n openshift-machine-api --no-headers
+	co_note_get "Infrastructure" get infrastructure cluster -o jsonpath='platform={.status.platform} topology={.status.controlPlaneTopology}{"\n"}'
+}
+
+co_path_cpms() {
+	co_note_get "ControlPlaneMachineSet" get controlplanemachineset -n openshift-machine-api
+	co_note_get "master Machines" get machines -n openshift-machine-api -l machine.openshift.io/cluster-api-machine-role=master
+}
+
+co_path_ingress() {
+	co_note_get "IngressControllers" get ingresscontroller -n openshift-ingress-operator
+	co_note_get "ingress-operator pods" get pods -n openshift-ingress-operator --no-headers
+	co_note_get "router pods" get pods -n openshift-ingress --no-headers
+}
+
+co_path_console() {
+	co_note_get "Console.operator" get console.operator cluster -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}) {.message}{"\n"}{end}'
+	co_note_get "console pods" get pods -n openshift-console --no-headers
+	co_note_get "console-operator pods" get pods -n openshift-console-operator --no-headers
+}
+
+co_path_image_registry() {
+	co_note_get "ImageRegistry config" get configs.imageregistry.operator.openshift.io cluster -o jsonpath='mgmt={.spec.managementState} replicas={.spec.replicas}{"\n"}{range .status.conditions[*]}{.type}={.status} ({.reason}) {.message}{"\n"}{end}'
+	co_note_get "image-registry pods" get pods -n openshift-image-registry --no-headers
+}
+
+co_path_storage() {
+	co_note_get "StorageClasses" get sc
+	co_note_get "cluster-storage-operator pods" get pods -n openshift-cluster-storage-operator --no-headers
+}
+
+co_path_monitoring() {
+	co_note_get "openshift-monitoring pods" get pods -n openshift-monitoring --no-headers
+}
+
+co_path_olm() {
+	co_note_get "OLM pods" get pods -n openshift-operator-lifecycle-manager --no-headers
+	co_note_get "CatalogSources" get catalogsource -A
+}
+
+co_path_marketplace() {
+	co_note_get "marketplace pods" get pods -n openshift-marketplace --no-headers
+	co_note_get "CatalogSources" get catalogsource -n openshift-marketplace
+}
+
+co_path_cloud_credential() {
+	co_note_get "CredentialsRequests" get credentialsrequest -A
+	co_note_get "CCO pods" get pods -n openshift-cloud-credential-operator --no-headers
+}
+
+co_path_ccm() {
+	co_note_get "cloud-controller-manager pods" get pods -n openshift-cloud-controller-manager --no-headers
+	co_note_get "CCM operator pods" get pods -n openshift-cloud-controller-manager-operator --no-headers
+}
+
+co_path_config() {
+	co_note_get "config-operator pods" get pods -n openshift-config-operator --no-headers
+	co_note_get "Infrastructure" get infrastructure cluster -o jsonpath='platform={.status.platform} topology={.status.controlPlaneTopology}{"\n"}'
+}
+
+co_path_insights() {
+	co_note_get "insights pods" get pods -n openshift-insights --no-headers
+}
+
+co_path_samples() {
+	co_note_get "Samples config" get configs.samples.operator.openshift.io cluster -o jsonpath='mgmt={.spec.managementState}{"\n"}{range .status.conditions[*]}{.type}={.status} ({.reason}) {.message}{"\n"}{end}'
+	co_note_get "samples-operator pods" get pods -n openshift-cluster-samples-operator --no-headers
+}
+
+co_path_node_tuning() {
+	co_note_get "Tuned" get tuned -A
+	co_note_get "Profile" get profile.tuned.openshift.io -A
+	co_note_get "NTO pods" get pods -n openshift-cluster-node-tuning-operator --no-headers
+}
+
+co_path_machine_approver() {
+	co_note_get "CertificateSigningRequests" get csr
+	co_note_get "machine-approver pods" get pods -n openshift-cluster-machine-approver --no-headers
+}
+
+co_path_service_ca() {
+	co_note_get "service-ca pods" get pods -n openshift-service-ca --no-headers
+	co_note_get "service-ca-operator pods" get pods -n openshift-service-ca-operator --no-headers
+}
+
+co_path_svm() {
+	co_note_get "storage-version-migrator pods" get pods -n openshift-kube-storage-version-migrator --no-headers
+}
+
+co_path_cluster_autoscaler() {
+	co_note_get "ClusterAutoscaler" get clusterautoscaler -A
+	co_note_get "MachineAutoscaler" get machineautoscaler -A
+}
+
+co_path_baremetal() {
+	co_note_get "BareMetalHosts" get baremetalhost -A
+	co_note_get "baremetal-operator / machine-api extra" get pods -n openshift-machine-api --no-headers
+}
+
+co_path_cluster_version() {
+	co_note_get "ClusterVersion" get clusterversion version
+	co_note_get "ClusterVersion conditions" get clusterversion version -o jsonpath='{range .status.conditions[*]}{.type}={.status} ({.reason}) {.message}{"\n"}{end}'
+	co_note_get "ClusterVersion history" get clusterversion version -o jsonpath='{range .status.history[*]}{.state}{" "}{.version}{" completed="}{.completionTime}{"\n"}{end}'
+	co_note_get "upgrade status" adm upgrade
+}
+
+# Prints the path id used for a ClusterOperator name (self-test + dispatch).
+co_path_name() {
+	local op="$1"
+	case "$op" in
+	etcd) printf '%s' staticpod-etcd ;;
+	kube-apiserver) printf '%s' staticpod-kas ;;
+	kube-controller-manager) printf '%s' staticpod-kcm ;;
+	kube-scheduler) printf '%s' staticpod-ks ;;
+	openshift-apiserver) printf '%s' oas ;;
+	openshift-controller-manager) printf '%s' ocm ;;
+	authentication) printf '%s' authentication ;;
+	network) printf '%s' network ;;
+	dns) printf '%s' dns ;;
+	machine-config) printf '%s' machine-config ;;
+	machine-api) printf '%s' machine-api ;;
+	control-plane-machine-set) printf '%s' cpms ;;
+	ingress) printf '%s' ingress ;;
+	console) printf '%s' console ;;
+	image-registry) printf '%s' image-registry ;;
+	storage | csi-snapshot-controller) printf '%s' storage ;;
+	monitoring) printf '%s' monitoring ;;
+	operator-lifecycle-manager | operator-lifecycle-manager-catalog | operator-lifecycle-manager-packageserver) printf '%s' olm ;;
+	marketplace) printf '%s' marketplace ;;
+	cloud-credential) printf '%s' cloud-credential ;;
+	cloud-controller-manager) printf '%s' ccm ;;
+	config) printf '%s' config ;;
+	insights) printf '%s' insights ;;
+	openshift-samples) printf '%s' samples ;;
+	node-tuning) printf '%s' node-tuning ;;
+	machine-approver) printf '%s' machine-approver ;;
+	service-ca) printf '%s' service-ca ;;
+	kube-storage-version-migrator) printf '%s' svm ;;
+	cluster-autoscaler) printf '%s' cluster-autoscaler ;;
+	baremetal) printf '%s' baremetal ;;
+	cluster-version) printf '%s' cluster-version ;;
+	*) printf '%s' generic ;;
+	esac
+}
+
+co_specific_path() {
+	local op="$1"
+	local pathid
+	pathid="$(co_path_name "$op")"
+	log_note "co_specific_path op=$op path=$pathid"
+	finding "Operator-specific path [$pathid] for clusteroperator/$op"
+	case "$pathid" in
+	staticpod-etcd) co_path_etcd ;;
+	staticpod-kas) co_path_kube_apiserver ;;
+	staticpod-kcm) co_path_kube_controller_manager ;;
+	staticpod-ks) co_path_kube_scheduler ;;
+	oas) co_path_openshift_apiserver ;;
+	ocm) co_path_openshift_controller_manager ;;
+	authentication) co_path_authentication ;;
+	network) co_path_network ;;
+	dns) co_path_dns ;;
+	machine-config) co_path_machine_config ;;
+	machine-api) co_path_machine_api ;;
+	cpms) co_path_cpms ;;
+	ingress) co_path_ingress ;;
+	console) co_path_console ;;
+	image-registry) co_path_image_registry ;;
+	storage) co_path_storage ;;
+	monitoring) co_path_monitoring ;;
+	olm) co_path_olm ;;
+	marketplace) co_path_marketplace ;;
+	cloud-credential) co_path_cloud_credential ;;
+	ccm) co_path_ccm ;;
+	config) co_path_config ;;
+	insights) co_path_insights ;;
+	samples) co_path_samples ;;
+	node-tuning) co_path_node_tuning ;;
+	machine-approver) co_path_machine_approver ;;
+	service-ca) co_path_service_ca ;;
+	svm) co_path_svm ;;
+	cluster-autoscaler) co_path_cluster_autoscaler ;;
+	baremetal) co_path_baremetal ;;
+	cluster-version) co_path_cluster_version ;;
+	generic)
+		finding "    no extra CR path for $op; relatedObjects namespaces and pod logs follow."
+		;;
+	esac
+}
+
 # ClusterOperator → catalog namespaces + relatedObjects → pods (optionally masters-only).
 # Static and cp-api operators auto-restrict to master nodes unless the caller already did.
 drill_cluster_operator() {
@@ -633,8 +1013,7 @@ drill_cluster_operator() {
 
 	if [[ "$op" == "cluster-version" ]]; then
 		finding "CVO is ClusterVersion + namespace openshift-cluster-version (not a ClusterOperator named cluster-version)."
-		oc_ro get clusterversion version -o jsonpath='desired={.status.desired.version} history0={.status.history[0].version}' || true
-		finding "    ClusterVersion: $LAST_OUT"
+		co_specific_path cluster-version
 		drill_namespace_pods openshift-cluster-version
 		FOCUS_MASTERS="$saved_focus"
 		return 0
@@ -681,6 +1060,8 @@ drill_cluster_operator() {
 			fi
 		done <<<"$LAST_OUT"
 	fi
+
+	co_specific_path "$op"
 
 	local extra catns
 	extra="$(cp_namespaces_for_co "$op" || true)"
@@ -1253,8 +1634,10 @@ jq_eval_masters() {
 	JQ_OUT="$(printf '%s' "$json" | "$JQ" -r --arg masters "$MASTER_NODES" "$query" 2>/dev/null)" || rc=$?
 	if [[ "$rc" -ne 0 || "$JQ_OUT" == "null" ]]; then
 		JQ_OUT=""
+		log_block "jq_eval_masters FAIL" "$query"
 		return 1
 	fi
+	log_block "jq_eval_masters ok" $'query:\n'"$query"$'\n\nJQ_OUT:\n'"$JQ_OUT"
 	return 0
 }
 
@@ -2405,6 +2788,8 @@ playbook_check() {
 	local podjson="$LAST_OUT"
 	if [[ "$DRY_RUN" -eq 1 ]]; then
 		oc_ro get clusteroperator authentication -o json || true
+		oc_ro get etcd cluster -o jsonpath='{range .status.nodeStatuses[*]}{.nodeName}{"\n"}{end}' || true
+		oc_ro get kubeapiserver cluster -o jsonpath='{range .status.nodeStatuses[*]}{.nodeName}{"\n"}{end}' || true
 		oc_ro get pods -n openshift-authentication-operator -o json || true
 		oc_ro logs -n openshift-authentication-operator unused-pod -c unused-container --tail="$LOG_TAIL" || true
 	fi
@@ -2527,6 +2912,7 @@ run_playbook() {
 	fi
 	echo "${C_BOLD}Intent:${C_RST} $id — ${INTENT_TITLE[$id]}"
 	echo "${C_DIM}Question: $question${C_RST}"
+	log_note "run_playbook id=$id fn=$fn question=$question"
 	"$fn" "$question"
 }
 
@@ -2535,9 +2921,11 @@ dispatch_question() {
 	local id="${FORCE_INTENT}"
 	reset_report
 
+	log_note "dispatch question=$question force=${FORCE_INTENT:-}"
 	if [[ -z "$id" ]]; then
 		local best_id best_s second_id second_s
 		IFS=$'\t' read -r best_id best_s second_id second_s <<<"$(match_intent "$question")"
+		log_note "match best=$best_id score=$best_s second=$second_id score=$second_s"
 		if [[ -z "$best_id" || "$best_s" -lt "$THRESHOLD" ]]; then
 			echo "Could not match that question to a playbook (best score ${best_s:-0})."
 			echo
@@ -2584,10 +2972,12 @@ interactive_loop() {
 			;;
 		check | --check)
 			reset_report
+			log_note "interactive --check"
 			echo "${C_BOLD}Intent:${C_RST} check — walk broken operators to pod/container logs"
 			playbook_check ""
 			;;
 		*)
+			log_note "interactive question=$line"
 			dispatch_question "$line" || true
 			;;
 		esac
@@ -2637,6 +3027,15 @@ assert_match() {
 
 run_self_test() {
 	echo "${C_BOLD}oc-ask self-test${C_RST}"
+	echo
+	if [[ -n "${LOG_FILE:-}" && -f "$LOG_FILE" ]]; then
+		echo "ok: debug log $LOG_FILE"
+	elif [[ -z "${OC_ASK_LOG:-}" ]]; then
+		echo "ok: debug log disabled"
+	else
+		echo "FAIL: debug log was not created"
+		SELFTEST_FAIL=$((SELFTEST_FAIL + 1))
+	fi
 	echo
 	echo "== intent matcher =="
 	assert_match "there is a node stuck in deleting state, what is the reason" "node_deleting"
@@ -2796,6 +3195,14 @@ run_self_test() {
 	echo "ok: catalog ovn ns"
 	[[ "$(cp_namespaces_for_co config)" == *openshift-config-operator* ]] || SELFTEST_FAIL=$((SELFTEST_FAIL + 1))
 	echo "ok: catalog config operator ns"
+	assert_eq "$(co_path_name etcd)" "staticpod-etcd" "path etcd"
+	assert_eq "$(co_path_name kube-apiserver)" "staticpod-kas" "path kas"
+	assert_eq "$(co_path_name authentication)" "authentication" "path auth"
+	assert_eq "$(co_path_name network)" "network" "path network"
+	assert_eq "$(co_path_name machine-config)" "machine-config" "path mco"
+	assert_eq "$(co_path_name operator-lifecycle-manager-packageserver)" "olm" "path olm packageserver"
+	assert_eq "$(co_path_name storage)" "storage" "path storage"
+	assert_eq "$(co_path_name aws-ebs-csi-driver-operator)" "generic" "path unknown CO is generic"
 
 	echo
 	echo "== normalize =="
@@ -2820,6 +3227,7 @@ DO_LIST=0
 DO_SELFTEST=0
 DO_CHECK=0
 ARGS=()
+OC_ASK_ORIG_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -2841,6 +3249,14 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--check)
 		DO_CHECK=1
+		shift
+		;;
+	--log)
+		OC_ASK_LOG="${2:-}"
+		shift 2
+		;;
+	--no-log)
+		OC_ASK_LOG=""
 		shift
 		;;
 	--oc)
@@ -2871,6 +3287,8 @@ while [[ $# -gt 0 ]]; do
 		;;
 	esac
 done
+
+log_init
 
 if [[ "$DO_SELFTEST" -eq 1 ]]; then
 	run_self_test

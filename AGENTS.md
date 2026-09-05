@@ -34,9 +34,12 @@ Catalog kinds: `static`, `cp-api`, `cp-net`, `node-agent`, `operator`. Empty TSV
 
 Named operator checks (`check etcd`, `check dns`) stay on `playbook_check`. `check cvo` delegates to `playbook_controlplane`.
 
+`drill_cluster_operator` always runs `co_specific_path` (native operator CR: Etcd/KubeAPIServer nodeStatuses, MCP, CPMS, IngressController, CSR, …) then the generic relatedObjects → unhealthy pod logs walk. Unknown COs use path `generic`.
+
 ## When changing code
 
 - Keep the allowlist strict. Never execute patch/delete/debug/must-gather/drain.
 - Add or update `--self-test` cases for new intents, aliases, and catalog rows.
 - User-facing docs live in `README.md`. Do not duplicate long usage there into code comments.
 - Do not commit kubeconfigs or secrets (see `.gitignore`).
+- Each run overwrites `oc_ask_log.txt` in the **current working directory** (bash trace + every `oc` stdout/stderr). That file is gitignored and may contain cluster data; ask for it when debugging a failure. `--no-log` disables it.

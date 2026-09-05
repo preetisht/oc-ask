@@ -47,7 +47,17 @@ export KUBECONFIG=/path/to/kubeconfig
 ./oc-ask.sh                 # interactive prompt
 ```
 
-Flags: `--oc PATH`, `--context NAME`, `--intent ID`, `--check [operator]`.
+Each run **overwrites** `oc_ask_log.txt` in the directory you launched from (not the script's directory). It includes every `oc` command, stdout/stderr, jq results, findings, and a bash trace. If the script fails, send that file. It can contain cluster details from `oc` output.
+
+Disable with `--no-log` or `OC_ASK_LOG=`. Override path with `--log /tmp/oc-ask.txt` or `OC_ASK_LOG`.
+
+`--check` / `check <operator>` still lists ClusterOperators, then for each unhealthy (or named) CO:
+
+1. **Operator-specific path** — native CRs for that operator (Etcd/KubeAPIServer revisions, MCP, CPMS, IngressController, CSRs, …)
+2. **Generic walk** — `relatedObjects` namespaces → unhealthy pods → container logs
+
+Unknown or platform-extra COs use the generic walk only.
+
 
 ## What it will and will not do
 

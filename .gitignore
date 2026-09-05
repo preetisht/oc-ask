@@ -6,3 +6,4 @@ kubeconfig
 .env.*
 *.pem
 *.key
+oc_ask_log.txt
