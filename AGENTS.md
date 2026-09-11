@@ -2,7 +2,7 @@
 
 Standalone bash helper. **Not** part of the OpenShift `oc` binary. Do not add this to `pkg/cli/` or `pkg/cli/cli.go`.
 
-Private GitHub repo: https://github.com/preetisht/oc-ask (`preetisht/oc-ask`). Local path: `/Users/pk/go/src/github.com/Azure/oc-ask`. Sibling of `/Users/pk/go/src/github.com/Azure/oc` (the CLI checkout). An untracked copy may still exist at `oc/contrib/oc-ask.sh`; do not commit it into `oc` unless the user asks.
+Public GitHub repo: https://github.com/preetisht/oc-ask (`preetisht/oc-ask`). Local path: `/Users/pk/go/src/github.com/Azure/oc-ask`. Sibling of `/Users/pk/go/src/github.com/Azure/oc` (the CLI checkout). An untracked copy may still exist at `oc/contrib/oc-ask.sh`; do not commit it into `oc` unless the user asks.
 
 ## Operating constraints (non-negotiable)
 
